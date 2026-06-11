@@ -78,8 +78,10 @@ def parse_sku(sku):
     return s[:-1], s[-1]
 
 def ten_mau(ten):
-    t = re.sub(r'-màu\s+\S+', '', str(ten))
-    t = re.sub(r'-[Ss]ize\s*\S+', '', t)
+    t = str(ten).strip()
+    t = re.sub(r'-màu\s+\S+', '', t, flags=re.I)
+    t = re.sub(r'-[Ss]ize\s*\S+', '', t, flags=re.I)
+    t = re.sub(r'\s+(35|36|37|38|39|40|41|42|43|44)$', '', t)
     return t.strip()
 
 # ─────────────────────────────────────────────────────────────
@@ -104,13 +106,14 @@ def load_sheet(file_bytes, sheet_name):
     return d
 
 def agg_mh(df):
-    return df.groupby(['nhom','ma_hang']).agg(
-        ten_mau = ('ten_mau',   'first'),
+    tmp = df.groupby(['nhom','ma_hang']).agg(
+        ten_mau = ('ten_mau', lambda s: min([str(x) for x in s if pd.notna(x)], key=len) if len([x for x in s if pd.notna(x)]) else ''),
         ban     = ('xuat_ban',  'sum'),
         ton     = ('ton_cuoi',  'sum'),
         ton_dau = ('ton_dau',   'sum'),
         nhap    = ('nhap_tong', 'sum'),
     ).reset_index()
+    return tmp
 
 def st_val(ban, ton):
     d = ban + ton
@@ -121,22 +124,38 @@ def vong_quay(ban, thang, ton):
     return round((ban / thang) / ton, 4)
 
 def danh_gia_fn(row):
-    ton, ban3 = row['ton_3t'], row['ban_3t']
-    st3, st6   = row['st3m'],  row['st6m']
-    vq3        = row['vq3m']
+    ton = row['ton_3t']
+    ban3 = row['ban_3t']
+    st3 = row['st3m']
+    st6 = row['st6m']
+    mos = row['mos3m']
 
     GOI_Y = {
-        'BÁN CHẠY':    'Cân nhắc nhập thêm',
-        'BÁN KHÁ':     'Theo dõi – nhập khi gần hết',
-        'BÁN VỪA':     'Duy trì mức tồn hiện tại',
-        'BÁN CHẬM':    'Xem xét điều chuyển',
-        'ĐIỀU CHUYỂN': 'Ưu tiên điều chuyển đi',
+        'BÁN CHẠY':'Cân nhắc nhập thêm',
+        'BÁN KHÁ':'Theo dõi – nhập khi gần hết',
+        'BÁN VỪA':'Duy trì mức tồn hiện tại',
+        'BÁN CHẬM':'Xem xét điều chuyển',
+        'ĐIỀU CHUYỂN':'Ưu tiên điều chuyển đi'
     }
 
-    if ton > 0 and ban3 == 0:
-        dg = 'ĐIỀU CHUYỂN'
-        cb = 'Đã bán trong 6T nhưng ngưng 3T' if st6 >= 0.25 else 'Bán kém cả 3T và 6T'
-        return dg, cb, GOI_Y[dg]
+    if ton > 0 and ban3 == 0 and st6 < 0.30:
+        return 'ĐIỀU CHUYỂN','Bán kém cả 3T và 6T',GOI_Y['ĐIỀU CHUYỂN']
+
+    if st3 >= 0.60 and mos < 1.5:
+        dg = 'BÁN CHẠY'
+    elif st3 >= 0.45 and mos < 3:
+        dg = 'BÁN KHÁ'
+    elif 3 <= mos <= 6:
+        dg = 'BÁN VỪA'
+    else:
+        dg = 'BÁN CHẬM'
+
+    trend = row['trend']
+    cb = ('📈 Đang tăng tốt' if trend >= 0.15 else
+          '📉 Đang giảm' if trend <= -0.15 else '')
+
+    return dg, cb, GOI_Y[dg]
+
 
     trend = row['trend']
     cb = ('📈 Đang tăng tốt' if trend >= 0.15 else
@@ -170,14 +189,18 @@ def run_analysis(file_bytes):
     agg['vq3m']  = agg.apply(lambda r: vong_quay(r['ban_3t'], 3, r['ton_3t']), axis=1)
     agg['vq6m']  = agg.apply(lambda r: vong_quay(r['ban_6t'], 6, r['ton_6t']), axis=1)
     agg['trend'] = (agg['st3m'] - agg['st6m']).round(4)
+    agg['mos3m'] = agg.apply(lambda r: round(r['ton_3t']/(r['ban_3t']/3),2) if r['ban_3t']>0 else 999, axis=1)
 
     results = agg.apply(lambda r: pd.Series(danh_gia_fn(r), index=['danh_gia','canh_bao','goi_y']), axis=1)
     agg = pd.concat([agg, results], axis=1)
     agg = agg.sort_values(['nhom','ma_hang']).reset_index(drop=True)
 
     # Size priority
-    size_df = df6r[['nhom','ma_hang','ma_sku','size_digit','xuat_ban','ton_cuoi']].copy()
-    size_df = size_df.rename(columns={'xuat_ban':'ban_6t','ton_cuoi':'ton'})
+    size_df = df6r[['nhom','ma_hang','size_digit','xuat_ban','ton_cuoi']].copy()
+    size_df = size_df.groupby(['nhom','ma_hang','size_digit'], as_index=False).agg(
+        ban_6t=('xuat_ban','sum'),
+        ton=('ton_cuoi','sum')
+    )
     size_max = size_df.groupby('ma_hang')['ban_6t'].max().rename('max_ban')
     size_df  = size_df.merge(size_max, on='ma_hang', how='left')
     size_df['size_index'] = size_df.apply(
@@ -333,7 +356,7 @@ def run_analysis(file_bytes):
     title_row(ws4,1,1,8,'PHÂN TÍCH SIZE – CHỈ SỐ ƯU TIÊN',C_BLUE)
     ws4.merge_cells('A2:H2')
     ws4.cell(2,1,'Size Index = Bán 6T size / Max bán 6T các size cùng mã hàng').font=F(size=9,color='555555')
-    for i,(h,w) in enumerate(zip(['Nhóm','Mã hàng','SKU','Size','Bán 6T','Tồn','Size Index','Xếp loại'],
+    for i,(h,w) in enumerate(zip(['Nhóm','Mã hàng','Size Digit','Size','Bán 6T','Tồn','Size Index','Xếp loại'],
                                    [15,22,24,6,9,9,11,14]),1):
         hdr(ws4,3,i,h,C_BLUE); cw(ws4,i,w)
     ws4.row_dimensions[3].height=22
@@ -343,7 +366,7 @@ def run_analysis(file_bytes):
         er=ri+3; bg='F5F5F5' if ri%2==0 else 'FFFFFF'
         xl=row.xep_loai; bg_xl,fg_xl=XLC.get(xl,('FFFFFF','000000'))
         sz=SIZE_MAP.get(row.size_digit, row.size_digit)
-        for ci,v in enumerate([row.nhom,row.ma_hang,row.ma_sku,sz,row.ban_6t,row.ton,f'{row.size_index:.1%}',xl],1):
+        for ci,v in enumerate([row.nhom,row.ma_hang,row.size_digit,sz,row.ban_6t,row.ton,f'{row.size_index:.1%}',xl],1):
             if ci==8: dc(ws4,er,ci,v,bg=bg_xl,bold=True,color=fg_xl)
             else: dc(ws4,er,ci,v,bg=bg,al='center' if ci in(4,5,6,7) else 'left')
         ws4.row_dimensions[er].height=15
